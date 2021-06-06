@@ -1,6 +1,11 @@
 const tensorFlow = require('@tensorflow/tfjs-node');
 const hpjs = require('hyperparameters');
 
+const ethPrices = require('./eth-prices-1620691200-to-1622992226.json');
+const ethPriceTimestamps = Object.keys(ethPrices).map((timestampString) =>
+  Number(timestampString)
+);
+
 const optimizers = {
   // sgd: tensorFlow.train.sgd,
   // adagrad: tensorFlow.train.adagrad,
@@ -16,7 +21,7 @@ const optimizers = {
 // Input and output data are passed as second argument
 async function optimizationFunction(
   { learningRate, optimizer, ewmaAlphaCoefficient, futureMinutes },
-  { prices }
+  { priceTimestamps }
 ) {
   // Create a simple sequential model.
   const model = tensorFlow.sequential();
@@ -30,19 +35,58 @@ async function optimizationFunction(
   );
   model.compile({
     loss: 'meanSquaredError', // standard
-    optimizer: optimizers[optimizer](learningRate),
+    optimizer: optimizers['adam'](learningRate),
   });
 
-  // Generating some data for training (y = 2x - 1) in tf tensors
+  // Generating some data for training in tf tensors
   // and defining its shape
-  // TODO: import prices, calculate EWMA, and calculate the difference.
-  // const ewmaPriceVsPriceDifferenceSignal = tensorFlow.tensor2d([...(EWMA - price) / price], [prices.length, 1]);
-  // const priceChange = tensorFlow.tensor2d([...(future price - now price) / (now price)], [prices.length, 1])
+  const ewmaPriceMinusPriceDifference = [];
+  const priceChangeDifference = [];
+
+  // avoid the 1st index and the last 360 minutes (6 hours) as a buffer for lookup
+  for (let index = 1; index < priceTimestamps.length - 361; index++) {
+    // Calculate Inputs EWMA Price Difference
+    const priceTimestamp = priceTimestamps[index];
+    const price = ethPrices[priceTimestamp][priceTimestamp];
+    const previousPriceTimestamp = priceTimestamps[index - 1];
+    const previousPrice =
+      ethPrices[previousPriceTimestamp][previousPriceTimestamp];
+    const ewma =
+      ewmaAlphaCoefficient * price + (1 - ewmaAlphaCoefficient) * previousPrice;
+    const ewmaMinusPrice = ewma - price / price;
+
+    ewmaPriceMinusPriceDifference.push(ewmaMinusPrice);
+
+    // Calculate Outputs
+    const futureSeconds = futureMinutes * 60;
+    const futurePriceTargetTimestamp = priceTimestamp + futureSeconds;
+    const futurePriceTimestamp = binarySearchTimestamp(
+      futurePriceTargetTimestamp,
+      0,
+      ethPriceTimestamps.length - 1
+    );
+    const futurePrice = ethPrices[futurePriceTimestamp][futurePriceTimestamp];
+    const priceDifference = (futurePrice - price) / price;
+    priceChangeDifference.push(priceDifference);
+  }
+
+  const ewmaPriceMinusPriceDifferenceSignals = tensorFlow.tensor2d(
+    ewmaPriceMinusPriceDifference,
+    [ewmaPriceMinusPriceDifference.length, 1]
+  );
+  const priceDifferenceSignals = tensorFlow.tensor2d(priceChangeDifference, [
+    priceChangeDifference.length,
+    1,
+  ]);
 
   // train model using defined data
-  const h = await model.fit(ewmaPriceVsPriceDifferenceSignal, priceChange, {
-    epochs: 5,
-  });
+  const h = await model.fit(
+    ewmaPriceMinusPriceDifferenceSignals,
+    priceDifferenceSignals,
+    {
+      epochs: 5,
+    }
+  );
 
   //printint out each optimizer and its loss
   console.log(optimizer);
@@ -64,10 +108,9 @@ async function hyperTensorFlowJs() {
   const space = {
     learningRate: hpjs.uniform(0.0001, 0.1),
     optimizers: hpjs.choice(['adam']),
-    // buyThreshold: hpjs.uniform(0.001, 0.1),
     ewmaAlphaCoefficient: hpjs.uniform(0.01, 0.1),
     futureMinutes: hpjs.uniform(1, 360),
-    // optimizer: hpjs.choice(['sgd', 'adagrad', 'adam', 'adamax', 'rmsprop']),
+    // buyThreshold: hpjs.uniform(0.001, 0.1),
   };
 
   // finding the optimal hyperparameters using hpjs.fmin.
@@ -77,7 +120,7 @@ async function hyperTensorFlowJs() {
     space,
     hpjs.search.randomSearch,
     50,
-    { rng: new hpjs.RandomState(654321), prices: [] }
+    { rng: new hpjs.RandomState(654321), priceTimestamps: ethPriceTimestamps }
   );
 
   const opt = trials.argmin;
@@ -86,11 +129,34 @@ async function hyperTensorFlowJs() {
   console.log('trials', trials);
   console.log('best optimizer:', opt.optimizer);
   console.log('best learning rate:', opt.learningRate);
-  console.log('best buyThreshold', opt.buyThreshold);
+  // console.log('best buyThreshold', opt.buyThreshold);
   console.log('best ewmaAlphaCoefficient', opt.ewmaAlphaCoefficient);
   console.log('best futureMinutes', opt.futureMinutes);
 }
 
-console.log('GO TENSORFLOW!');
+function binarySearchTimestamp(targetTimestamp, startIndex, endIndex) {
+  const midIndex = Math.floor((startIndex + endIndex) / 2);
+  const previousTimestamp = ethPriceTimestamps[midIndex - 1];
+  const nextTimestamp = ethPriceTimestamps[midIndex + 1];
+  const midTimestamp = ethPriceTimestamps[midIndex];
 
+  // Base Case
+  if (
+    previousTimestamp <= targetTimestamp &&
+    targetTimestamp <= nextTimestamp
+  ) {
+    return midTimestamp;
+  }
+
+  // Recursive Case
+  if (midTimestamp > targetTimestamp) {
+    // look left
+    return binarySearchTimestamp(targetTimestamp, startIndex, midIndex - 1);
+  } else {
+    // look right
+    return binarySearchTimestamp(targetTimestamp, midIndex + 1, endIndex);
+  }
+}
+
+console.log('GO TENSORFLOW!');
 hyperTensorFlowJs();
