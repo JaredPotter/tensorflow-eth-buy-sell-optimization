@@ -12,6 +12,7 @@
   "license": "ISC",
   "dependencies": {
     "@tensorflow/tfjs-node": "^3.7.0",
+    "fs-extra": "^10.0.0",
     "hyperparameters": "^0.25.6"
   }
 }

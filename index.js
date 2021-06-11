@@ -1,7 +1,11 @@
 const tensorFlow = require('@tensorflow/tfjs-node');
 const hpjs = require('hyperparameters');
+const fs = require('fs-extra');
 
-const ethPrices = require('./eth-prices-1620691200-to-1622992226.json');
+const EPOCH = 20;
+const BATCH_SIZE = 128;
+
+const ethPrices = require('./eth-prices-1620691200-to-1623296112.json');
 const ethPriceTimestamps = Object.keys(ethPrices).map((timestampString) =>
   Number(timestampString)
 );
@@ -52,12 +56,16 @@ async function optimizationFunction(
     ewmaListOfList.push([]);
   }
 
-  const predictions = []; // 300 blocks in the future; 500, 1000
+  const futurePriceIncrease = []; // 300 blocks in the future; 500, 1000
+  const priceDifferences = [];
+  const timestamps = [];
+  let lastPerviousTimestampBuySignal = false;
 
   // avoid the 1st index and the last 360 minutes (6 hours) as a buffer for lookup
   for (let index = 1; index < priceTimestamps.length - 361; index++) {
     // Calculate Inputs EWMA Price Difference
     const priceTimestamp = priceTimestamps[index];
+    timestamps.push(priceTimestamp);
     const price = ethPrices[priceTimestamp][priceTimestamp];
     const previousPriceTimestamp = priceTimestamps[index - 1];
     const previousPrice =
@@ -74,7 +82,8 @@ async function optimizationFunction(
     prices.push(price);
 
     // Calculate Outputs
-    const futureSeconds = futureMinutes * 60;
+    const futureMinutesTemp = 60;
+    const futureSeconds = futureMinutesTemp * 60;
     const futurePriceTargetTimestamp = priceTimestamp + futureSeconds;
     const futurePriceTimestamp = binarySearchTimestamp(
       futurePriceTargetTimestamp,
@@ -84,28 +93,76 @@ async function optimizationFunction(
     const futurePrice = ethPrices[futurePriceTimestamp][futurePriceTimestamp];
     const priceDifference = (futurePrice - price) / price;
 
+    priceDifferences.push(priceDifference);
+
     if (priceDifference >= 0.02) {
-      predictions.push(1);
+      futurePriceIncrease.push(1);
+      // lastPerviousTimestampBuySignal = true;
     } else {
-      predictions.push(0);
+      // lastPerviousTimestampBuySignal = false;
+      futurePriceIncrease.push(0);
     }
   }
+
+  // const myTable = [
+  //   ...ewmaListOfList,
+  //   prices,
+  //   futurePriceIncrease,
+  //   priceDifferences,
+  //   timestamps,
+  // ];
+  // debugger;
+  // const outputFilename = 'my-table.csv';
+  // try {
+  //   fs.unlinkSync(outputFilename);
+  // } catch (error) {}
+  // fs.ensureFileSync(outputFilename);
+  // fs.appendFileSync(
+  //   outputFilename,
+  //   `ewma_01,ewma_005,ewma_001,price,buy_signal,price_diff,timestamp\n`
+  // );
+
+  // for (let i = 0; i < prices.length; i++) {
+  //   fs.appendFileSync(
+  //     outputFilename,
+  //     `${myTable[0][i]},${myTable[1][i]},${myTable[2][i]},${myTable[3][i]},${myTable[4][i]},${myTable[5][i]},${myTable[6][i]}\n`
+  //   );
+  // }
+
+  // return;
 
   // const ewmaXs = tensorFlow.tensor2d(ewmaListOfList, [ewmas[0].length, 3]);
   // const ewmaXs = tensorFlow
   //
-  const result = [...ewmaListOfList, prices];
+  // const result = [...ewmaListOfList, prices];
+  const xsDataSet = [...ewmaListOfList, prices];
+  const xsDateSetTraining = [
+    xsDataSet[0].slice(0, Math.round(xsDataSet[0].length * 0.8)),
+    xsDataSet[1].slice(0, Math.round(xsDataSet[1].length * 0.8)),
+    xsDataSet[2].slice(0, Math.round(xsDataSet[2].length * 0.8)),
+    xsDataSet[3].slice(0, Math.round(xsDataSet[3].length * 0.8)),
+  ];
+  const xsDateSetValidation = [
+    xsDataSet[0].slice(Math.round(xsDataSet[0].length * 0.8) + 1),
+    xsDataSet[1].slice(Math.round(xsDataSet[1].length * 0.8) + 1),
+    xsDataSet[2].slice(Math.round(xsDataSet[2].length * 0.8) + 1),
+    xsDataSet[3].slice(Math.round(xsDataSet[3].length * 0.8) + 1),
+  ];
 
   // const concat = tensorFlow.concat(result, (axis = 1)); // ([ewmas, prices], (axis = 1));
   // const xs = tensorFlow.tensor2d([stack], stack.shape);
-  const xs = tensorFlow.tensor2d(result).transpose();
+  const xs = tensorFlow.tensor2d(xsDateSetTraining).transpose();
 
-  // const priceDifferenceSignals = tensorFlow.tensor2d(priceChangeDifference, [
-  //   priceChangeDifference.length,
-  //   1,
-  // ]);
+  const ysDataSet = futurePriceIncrease;
+  const ysDataSetTraining = ysDataSet.slice(
+    0,
+    Math.round(ysDataSet.length * 0.8)
+  );
+  const ysDataSetValidation = ysDataSet.slice(
+    Math.round(ysDataSet.length * 0.8) + 1
+  );
 
-  const ys = tensorFlow.tensor1d(predictions);
+  const ys = tensorFlow.tensor1d(ysDataSetTraining);
 
   // Xs / inputs
   // EWMA Prices; 0.1, 0.05, 0.01 alphas
@@ -113,18 +170,22 @@ async function optimizationFunction(
   // Price
   // What other technical traders are looking at...
 
-  // Ys / outputs / predictions
+  // Ys / outputs / futurePriceIncrease
   // The binary 1 or 0 signal, buy or not.
   // debugger;
   // train model using defined data
+  // TODO: randomize our training.
   const h = await model.fit(xs, ys, {
-    epochs: 3,
-    batchSize: 128,
+    epochs: EPOCH,
+    batchSize: BATCH_SIZE,
   });
 
-  const res = await model.getWeights()[1].data();
-
+  const weightsObject = model.getWeights();
+  const res1 = await weightsObject[0].data(); // kernel
+  const res2 = await weightsObject[1].data(); // bias
   debugger;
+  console.log(res1);
+
   //printint out each optimizer and its loss
   console.log(optimizer);
   console.log(
@@ -158,7 +219,7 @@ async function hyperTensorFlowJs() {
     optimizationFunction,
     space,
     hpjs.search.randomSearch,
-    50, // max_estimates
+    1, // max_estimates
     { rng: new hpjs.RandomState(654321), priceTimestamps: ethPriceTimestamps }
   );
 
