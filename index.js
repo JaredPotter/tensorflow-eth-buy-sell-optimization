@@ -6,6 +6,8 @@ const ethPriceTimestamps = Object.keys(ethPrices).map((timestampString) =>
   Number(timestampString)
 );
 
+const ewmaAlphaCoefficients = [0.1, 0.05, 0.01];
+
 const optimizers = {
   // sgd: tensorFlow.train.sgd,
   // adagrad: tensorFlow.train.adagrad,
@@ -20,7 +22,7 @@ const optimizers = {
 // use the loss returned by the fn to measure which parameters are "best"
 // Input and output data are passed as second argument
 async function optimizationFunction(
-  { learningRate, optimizer, ewmaAlphaCoefficient, futureMinutes },
+  { learningRate, optimizer, futureMinutes },
   { priceTimestamps }
 ) {
   // Create a simple sequential model.
@@ -29,8 +31,10 @@ async function optimizationFunction(
   // add a dense layer to the model and compile
   model.add(
     tensorFlow.layers.dense({
-      units: 1 /* Output Dimensions */,
-      inputShape: [1] /* EWMA - Price = Diff */,
+      // Add a fully connected layer output = activation(dot(input, kernel) + bias)
+      units: 1, // 1 neuron /* Output Dimensions */, 300, 500, 1000 blocks in the future
+      inputShape: [4], // 3 different EWMAs, price // total of 4
+      activation: 'sigmoid', // Activation function, sigmoid function: compress the output value to between 0-1
     })
   );
   model.compile({
@@ -40,8 +44,15 @@ async function optimizationFunction(
 
   // Generating some data for training in tf tensors
   // and defining its shape
-  const ewmaPriceMinusPriceDifference = [];
-  const priceChangeDifference = [];
+  // const ewmaPrices = [];
+  const prices = [];
+  const ewmaListOfList = [];
+
+  for (let i = 0; i < ewmaAlphaCoefficients.length; i++) {
+    ewmaListOfList.push([]);
+  }
+
+  const predictions = []; // 300 blocks in the future; 500, 1000
 
   // avoid the 1st index and the last 360 minutes (6 hours) as a buffer for lookup
   for (let index = 1; index < priceTimestamps.length - 361; index++) {
@@ -51,11 +62,16 @@ async function optimizationFunction(
     const previousPriceTimestamp = priceTimestamps[index - 1];
     const previousPrice =
       ethPrices[previousPriceTimestamp][previousPriceTimestamp];
-    const ewma =
-      ewmaAlphaCoefficient * price + (1 - ewmaAlphaCoefficient) * previousPrice;
-    const ewmaMinusPrice = ewma - price / price;
 
-    ewmaPriceMinusPriceDifference.push(ewmaMinusPrice);
+    for (let i = 0; i < ewmaAlphaCoefficients.length; i++) {
+      const ewma =
+        ewmaAlphaCoefficients[i] * price +
+        (1 - ewmaAlphaCoefficients[i]) * previousPrice;
+
+      ewmaListOfList[i].push(ewma);
+    }
+
+    prices.push(price);
 
     // Calculate Outputs
     const futureSeconds = futureMinutes * 60;
@@ -67,27 +83,48 @@ async function optimizationFunction(
     );
     const futurePrice = ethPrices[futurePriceTimestamp][futurePriceTimestamp];
     const priceDifference = (futurePrice - price) / price;
-    priceChangeDifference.push(priceDifference);
+
+    if (priceDifference >= 0.02) {
+      predictions.push(1);
+    } else {
+      predictions.push(0);
+    }
   }
 
-  const ewmaPriceMinusPriceDifferenceSignals = tensorFlow.tensor2d(
-    ewmaPriceMinusPriceDifference,
-    [ewmaPriceMinusPriceDifference.length, 1]
-  );
-  const priceDifferenceSignals = tensorFlow.tensor2d(priceChangeDifference, [
-    priceChangeDifference.length,
-    1,
-  ]);
+  // const ewmaXs = tensorFlow.tensor2d(ewmaListOfList, [ewmas[0].length, 3]);
+  // const ewmaXs = tensorFlow
+  //
+  const result = [...ewmaListOfList, prices];
 
+  // const concat = tensorFlow.concat(result, (axis = 1)); // ([ewmas, prices], (axis = 1));
+  // const xs = tensorFlow.tensor2d([stack], stack.shape);
+  const xs = tensorFlow.tensor2d(result).transpose();
+
+  // const priceDifferenceSignals = tensorFlow.tensor2d(priceChangeDifference, [
+  //   priceChangeDifference.length,
+  //   1,
+  // ]);
+
+  const ys = tensorFlow.tensor1d(predictions);
+
+  // Xs / inputs
+  // EWMA Prices; 0.1, 0.05, 0.01 alphas
+
+  // Price
+  // What other technical traders are looking at...
+
+  // Ys / outputs / predictions
+  // The binary 1 or 0 signal, buy or not.
+  // debugger;
   // train model using defined data
-  const h = await model.fit(
-    ewmaPriceMinusPriceDifferenceSignals,
-    priceDifferenceSignals,
-    {
-      epochs: 5,
-    }
-  );
+  const h = await model.fit(xs, ys, {
+    epochs: 3,
+    batchSize: 128,
+  });
 
+  const res = await model.getWeights()[1].data();
+
+  debugger;
   //printint out each optimizer and its loss
   console.log(optimizer);
   console.log(
@@ -106,9 +143,11 @@ async function optimizationFunction(
 async function hyperTensorFlowJs() {
   // defining a search space we want to optimize. Using hpjs parameters here
   const space = {
-    learningRate: hpjs.uniform(0.0001, 0.1),
+    learningRate: 0.001,
+    // learningRate: hpjs.uniform(0.0001, 0.1),
     optimizers: hpjs.choice(['adam']),
-    ewmaAlphaCoefficient: hpjs.uniform(0.01, 0.1),
+    // ewmaAlphaCoefficient: hpjs.uniform(0.01, 0.1),
+    // ewmaAlphaCoefficients: [0.1, 0.05, 0.01],
     futureMinutes: hpjs.uniform(1, 360),
     // buyThreshold: hpjs.uniform(0.001, 0.1),
   };
@@ -119,7 +158,7 @@ async function hyperTensorFlowJs() {
     optimizationFunction,
     space,
     hpjs.search.randomSearch,
-    50,
+    50, // max_estimates
     { rng: new hpjs.RandomState(654321), priceTimestamps: ethPriceTimestamps }
   );
 
